@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from unittest.mock import patch
 
 import torch
 
@@ -72,13 +73,35 @@ def main():
         index = dataset.img_names.index(str(filename))
         image, gradient, label = dataset[index]
         assert dataset.tags[label] == name, (name, dataset.tags[label])
-        assert image.shape == gradient.shape == (3, 32, 32)
+        assert image.shape == gradient.shape == (3, 64, 64)
         assert torch.isfinite(gradient).all() and 0 <= gradient.min() <= gradient.max() <= 1
         indices.append(index)
     loader = torch.utils.data.DataLoader(
         torch.utils.data.Subset(dataset, indices[:2]), batch_size=2, num_workers=0)
     batch = next(iter(loader))
-    model = scope['WRNDualConvNet'](classes_num=100).to(device)
+    mean = torch.tensor(scope['RGB_MEAN']).view(3, 1, 1)
+    std = torch.tensor(scope['RGB_STD']).view(3, 1, 1)
+    # Every augmented RGB image must have a gradient generated from that exact view.
+    augmented = scope['train_source']
+    views = []
+    for _ in range(4):
+        rgb, gradient, _ = augmented[0]
+        raw = (rgb * std + mean).clamp(0, 1)
+        expected = augmented.RGB2Gradient(raw)
+        assert torch.allclose(gradient, expected, atol=2e-6, rtol=2e-5)
+        views.append(rgb)
+    assert any(not torch.equal(views[0], view) for view in views[1:]), 'No training augmentation'
+    first_val = scope['val_dataset'][0]
+    second_val = scope['val_dataset'][0]
+    assert all(torch.equal(a, b) for a, b in zip(first_val[:2], second_val[:2]))
+    # Batch processing must match independent per-image Sobel normalization.
+    raw = torch.rand(2, 3, 64, 64)
+    raw[1] *= 0.1
+    batched = scope['mydataset'].RGB2Gradient(raw)
+    separate = torch.stack([scope['mydataset'].RGB2Gradient(image) for image in raw])
+    assert torch.allclose(batched, separate, atol=1e-6)
+    assert torch.count_nonzero(scope['mydataset'].RGB2Gradient(torch.zeros_like(raw))) == 0
+    model = scope['DualConvNet'](classes_num=100).to(device)
     rgb_modules = [model.prepareRGB, model.layerRGB1, model.layerRGB2, model.layerRGB3]
     gradient_modules = [model.prepare, model.layer1, model.layer2, model.layer3]
     rgb_parameters = {id(p) for m in rgb_modules for p in m.parameters()}
@@ -90,15 +113,12 @@ def main():
     features = {}
     handles = []
     expected_shapes = {
-        'prepareRGB': (2, 16, 32, 32), 'prepare': (2, 16, 32, 32),
-        'layerRGB1': (2, 32, 32, 32), 'layer1': (2, 32, 32, 32),
-        'layerRGB2': (2, 64, 16, 16), 'layer2': (2, 64, 16, 16),
-        'layerRGB3': (2, 128, 8, 8), 'layer3': (2, 128, 8, 8),
-        'cross_attention': (2, 128, 8, 8),
+        'prepareRGB': (2, 64, 16, 16), 'prepare': (2, 64, 16, 16),
+        'layerRGB1': (2, 64, 16, 16), 'layer1': (2, 64, 16, 16),
+        'layerRGB2': (2, 128, 8, 8), 'layer2': (2, 128, 8, 8),
+        'layerRGB3': (2, 256, 4, 4), 'layer3': (2, 256, 4, 4),
+        'cross_attention': (2, 256, 4, 4),
     }
-    assert all(len(getattr(model, name)) == 4 for name in
-               ('layer1', 'layer2', 'layer3', 'layerRGB1', 'layerRGB2', 'layerRGB3'))
-    assert sum(p.numel() for p in model.parameters()) < 3_500_000
     for name in expected_shapes:
         handles.append(getattr(model, name).register_forward_hook(
             lambda module, inputs, output, key=name: features.update({key: output.detach()})))
@@ -138,6 +158,31 @@ def main():
     assert all(not module.training for module in model.modules())
     assert all(torch.equal(value, buffers[name]) for name, value in model.named_buffers())
 
+    # Check disabled Mixup and a controlled nontrivial RGB/label mixture.
+    disabled = scope['mixup_batch'](image, gradient, batch[2].to(device), alpha=0)
+    assert disabled[0] is image and disabled[1] is gradient and disabled[3] == 1
+    reverse = torch.tensor([1, 0], device=device)
+    with patch.object(torch.distributions.Beta, 'sample', return_value=torch.tensor(0.7)), \
+            patch('torch.randperm', return_value=reverse):
+        mixed, mixed_gradient, target_b, lam = scope['mixup_batch'](
+            image, gradient, batch[2].to(device), alpha=0.2)
+        assert torch.allclose(mixed, lam * image + (1 - lam) * image[reverse])
+        assert torch.equal(target_b, batch[2].to(device)[reverse])
+        expected_raw = (mixed * std.to(device) + mean.to(device)).clamp(0, 1)
+        expected_gradient = torch.stack([
+            scope['mydataset'].RGB2Gradient(item) for item in expected_raw])
+        assert torch.allclose(mixed_gradient, expected_gradient, atol=2e-6, rtol=2e-5)
+        captured_logits = []
+        handle = model.register_forward_hook(
+            lambda module, inputs, output: captured_logits.append(output.detach()))
+        mix_loss = scope['train']([batch], model, optimizer, criterion, epoch=0, mixup_alpha=0.2)
+        handle.remove()
+        targets = batch[2].to(device)
+        expected_loss = (lam * criterion(captured_logits[0], targets)
+                         + (1 - lam) * criterion(captured_logits[0], target_b))
+        assert abs(mix_loss - expected_loss.item()) < 1e-5
+        assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters())
+
     # Exercise the single-image cell with its actual Sobel/batch/eval handling.
     scope.update(net=model, test_dataset=dataset)
     exec(compile(''.join(notebook['cells'][9]['source']), 'single_image', 'exec'), scope)
@@ -146,18 +191,19 @@ def main():
         scope['save_checkpoint']({'architecture': type(model).__name__, 'net': model.state_dict()},
                                  True, output)
         state = torch.load(Path(output) / 'best.pt', map_location='cpu', weights_only=True)
-        assert state['architecture'] == 'WRNDualConvNet'
+        assert state['architecture'] == 'DualConvNet'
         model.load_state_dict(state['net'])
         assert (Path(output) / 'last.pt').exists()
 
         # Run the real selection/reload loop with controlled validation scores.
         # Four tiny epochs verify zero accuracy, regression, and tied best scores.
-        selection_output = str(Path(output) / 'selection')
+        selection_root = str(Path(output) / 'selection')
+        selection_output = selection_root + '_dropout_0'
         tiny_model = torch.nn.Linear(1, 1)
         tiny_optimizer = torch.optim.SGD(tiny_model.parameters(), lr=0.01)
         scores = iter(enumerate((0.0, 30.0, 20.0, 30.0), start=1))
 
-        def fake_train(loader, net, optimizer, criterion, epoch):
+        def fake_train(loader, net, optimizer, criterion, epoch, mixup_alpha=0.0):
             with torch.no_grad():
                 net.weight.fill_(epoch)
             return 1.0
@@ -174,7 +220,7 @@ def main():
         training_source = ''.join(notebook['cells'][7]['source'])
         loop = training_source[training_source.index('config = {'):]
         loop = loop.replace('"epochs": 30', '"epochs": 4')
-        loop = loop.replace('"./result/wrn_dual_cross_attention"', repr(selection_output))
+        loop = loop.replace('"./result/dual_augmented"', repr(selection_root))
         with redirect_stdout(io.StringIO()):
             exec(compile(loop, 'checkpoint_selection', 'exec'), loop_scope)
         best = torch.load(Path(selection_output) / 'best.pt', weights_only=True)
@@ -187,26 +233,21 @@ def main():
         assert tiny_model.weight.item() == 2, 'Final model did not restore the best weights'
         assert last['net']['weight'].item() == 4
         assert not list(Path(selection_output).glob('*.tmp'))
-    # Named channel constants must control both branches, attention, and the head.
-    # Compile a changed-width variant in memory; leave the notebook untouched.
-    model_source = ''.join(notebook['cells'][5]['source'])
-    wrn = next(n for n in ast.parse(model_source).body
-               if isinstance(n, ast.ClassDef) and n.name == 'WRNDualConvNet')
-    changed_widths = ast.get_source_segment(model_source, wrn)
-    for old_width, new_width in [('channel1 = 32', 'channel1 = 24'),
-                                 ('channel2 = 64', 'channel2 = 48'),
-                                 ('channel3 = 128', 'channel3 = 96')]:
-        assert old_width in changed_widths
-        changed_widths = changed_widths.replace(old_width, new_width)
-    variant_scope = dict(scope)
-    exec(compile(changed_widths, 'changed_channel_constants', 'exec'), variant_scope)
-    variant = variant_scope['WRNDualConvNet'](100, blocks_per_stage=2).eval()
-    assert all(len(getattr(variant, name)) == 2 for name in
-               ('layer1', 'layer2', 'layer3', 'layerRGB1', 'layerRGB2', 'layerRGB3'))
-    assert variant.cross_attention.rgb_attention.embed_dim == variant.head[-1].in_features == 96
-    with torch.no_grad():
-        variant_logits = variant(batch[0], batch[1])
-    assert variant_logits.shape == (2, 100) and torch.isfinite(variant_logits).all()
+    # Classification-head Dropout changes activations only in training.
+    regularized = scope['DualConvNet'](100, dropout_p=0.2)
+    dropout = regularized.head[-2]
+    assert isinstance(dropout, torch.nn.Dropout) and dropout.p == 0.2
+    activations = torch.ones(128, 512)
+    dropout.train()
+    dropped = dropout(activations)
+    assert 0.15 < (dropped == 0).float().mean().item() < 0.25
+    dropout.eval()
+    assert torch.equal(dropout(activations), activations)
+    assert sum(p.numel() for p in regularized.parameters()) == sum(p.numel() for p in model.parameters())
+    regularized.train()
+    dropout_loss = criterion(regularized(batch[0], batch[1]).to(device), batch[2].to(device))
+    dropout_loss.backward()
+    assert all(p.grad is not None and torch.isfinite(p.grad).all() for p in regularized.parameters())
     total = sum(p.numel() for p in model.parameters())
     attention = sum(p.numel() for p in model.cross_attention.parameters())
     print(f'PASS: device={device}, parameters={total:,}, cross_attention={attention:,}')
