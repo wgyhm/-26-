@@ -72,13 +72,13 @@ def main():
         index = dataset.img_names.index(str(filename))
         image, gradient, label = dataset[index]
         assert dataset.tags[label] == name, (name, dataset.tags[label])
-        assert image.shape == gradient.shape == (3, 64, 64)
+        assert image.shape == gradient.shape == (3, 32, 32)
         assert torch.isfinite(gradient).all() and 0 <= gradient.min() <= gradient.max() <= 1
         indices.append(index)
     loader = torch.utils.data.DataLoader(
         torch.utils.data.Subset(dataset, indices[:2]), batch_size=2, num_workers=0)
     batch = next(iter(loader))
-    model = scope['DualConvNet'](classes_num=100).to(device)
+    model = scope['WRNDualConvNet'](classes_num=100).to(device)
     rgb_modules = [model.prepareRGB, model.layerRGB1, model.layerRGB2, model.layerRGB3]
     gradient_modules = [model.prepare, model.layer1, model.layer2, model.layer3]
     rgb_parameters = {id(p) for m in rgb_modules for p in m.parameters()}
@@ -89,7 +89,17 @@ def main():
 
     features = {}
     handles = []
-    for name in ('layerRGB3', 'layer3', 'cross_attention'):
+    expected_shapes = {
+        'prepareRGB': (2, 16, 32, 32), 'prepare': (2, 16, 32, 32),
+        'layerRGB1': (2, 32, 32, 32), 'layer1': (2, 32, 32, 32),
+        'layerRGB2': (2, 64, 16, 16), 'layer2': (2, 64, 16, 16),
+        'layerRGB3': (2, 128, 8, 8), 'layer3': (2, 128, 8, 8),
+        'cross_attention': (2, 128, 8, 8),
+    }
+    assert all(len(getattr(model, name)) == 4 for name in
+               ('layer1', 'layer2', 'layer3', 'layerRGB1', 'layerRGB2', 'layerRGB3'))
+    assert sum(p.numel() for p in model.parameters()) < 3_500_000
+    for name in expected_shapes:
         handles.append(getattr(model, name).register_forward_hook(
             lambda module, inputs, output, key=name: features.update({key: output.detach()})))
     optimizer = torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
@@ -104,7 +114,8 @@ def main():
                       model.cross_attention.gradient_attention.in_proj_weight):
         assert parameter.grad.abs().sum() > 0, 'A branch or attention direction is disconnected'
     assert not torch.equal(before, model.cross_attention.rgb_attention.in_proj_weight)
-    assert all(value.shape == (2, 256, 4, 4) for value in features.values())
+    assert set(features) == set(expected_shapes)
+    assert all(tuple(features[name].shape) == shape for name, shape in expected_shapes.items())
     accuracy = scope['test']([batch], model, criterion)
     assert 0 <= accuracy <= 100
     image, gradient, _ = (item.to(device) for item in batch)
@@ -132,10 +143,10 @@ def main():
     exec(compile(''.join(notebook['cells'][9]['source']), 'single_image', 'exec'), scope)
     assert scope['out'].shape == (1, 100)
     with tempfile.TemporaryDirectory(prefix='.cross-attention-smoke-', dir=project) as output:
-        scope['save_checkpoint']({'architecture': 'DualConvNet', 'net': model.state_dict()},
+        scope['save_checkpoint']({'architecture': type(model).__name__, 'net': model.state_dict()},
                                  True, output)
         state = torch.load(Path(output) / 'best.pt', map_location='cpu', weights_only=True)
-        assert state['architecture'] == 'DualConvNet'
+        assert state['architecture'] == 'WRNDualConvNet'
         model.load_state_dict(state['net'])
         assert (Path(output) / 'last.pt').exists()
 
@@ -163,7 +174,7 @@ def main():
         training_source = ''.join(notebook['cells'][7]['source'])
         loop = training_source[training_source.index('config = {'):]
         loop = loop.replace('"epochs": 30', '"epochs": 4')
-        loop = loop.replace('"./result/dual_cross_attention"', repr(selection_output))
+        loop = loop.replace('"./result/wrn_dual_cross_attention"', repr(selection_output))
         with redirect_stdout(io.StringIO()):
             exec(compile(loop, 'checkpoint_selection', 'exec'), loop_scope)
         best = torch.load(Path(selection_output) / 'best.pt', weights_only=True)
@@ -176,6 +187,26 @@ def main():
         assert tiny_model.weight.item() == 2, 'Final model did not restore the best weights'
         assert last['net']['weight'].item() == 4
         assert not list(Path(selection_output).glob('*.tmp'))
+    # Named channel constants must control both branches, attention, and the head.
+    # Compile a changed-width variant in memory; leave the notebook untouched.
+    model_source = ''.join(notebook['cells'][5]['source'])
+    wrn = next(n for n in ast.parse(model_source).body
+               if isinstance(n, ast.ClassDef) and n.name == 'WRNDualConvNet')
+    changed_widths = ast.get_source_segment(model_source, wrn)
+    for old_width, new_width in [('channel1 = 32', 'channel1 = 24'),
+                                 ('channel2 = 64', 'channel2 = 48'),
+                                 ('channel3 = 128', 'channel3 = 96')]:
+        assert old_width in changed_widths
+        changed_widths = changed_widths.replace(old_width, new_width)
+    variant_scope = dict(scope)
+    exec(compile(changed_widths, 'changed_channel_constants', 'exec'), variant_scope)
+    variant = variant_scope['WRNDualConvNet'](100, blocks_per_stage=2).eval()
+    assert all(len(getattr(variant, name)) == 2 for name in
+               ('layer1', 'layer2', 'layer3', 'layerRGB1', 'layerRGB2', 'layerRGB3'))
+    assert variant.cross_attention.rgb_attention.embed_dim == variant.head[-1].in_features == 96
+    with torch.no_grad():
+        variant_logits = variant(batch[0], batch[1])
+    assert variant_logits.shape == (2, 100) and torch.isfinite(variant_logits).all()
     total = sum(p.numel() for p in model.parameters())
     attention = sum(p.numel() for p in model.cross_attention.parameters())
     print(f'PASS: device={device}, parameters={total:,}, cross_attention={attention:,}')
