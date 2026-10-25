@@ -2,3 +2,5 @@
 /.ipynb_checkpoints
 cifar100.tar
 /.cache/
+/experiments/
+/result/
