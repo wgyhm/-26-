@@ -6,3 +6,8 @@
 
 # Notebook checkpoints
 **/.ipynb_checkpoints/
+FDU-Computer_Vision_Basics-exp1
+
+# Generated experiment artifacts (at any directory depth)
+experiments/
+result/
